@@ -129,20 +129,10 @@ esac
 # We do NOT stop, mask, or kill NM here.
 #
 # The apt postinstall already started NM - fighting it now races with
-# networkd and can briefly drop the interface, killing SSH (ask me how
-# I know).  It's safe to leave NM running alongside networkd until reboot:
-# NM has no connection profiles yet so it won't reconfigure any interface.
+# networkd and can briefly drop the interface, killing SSH.  It's safe
+# to leave NM running alongside networkd until reboot: NM has no
+# connection profiles yet so it won't reconfigure any interface.
 # The oneshot masks networkd and takes full control at the start of next boot.
-#
-# We DO suppress NM's auto-DHCP fallback so it doesn't speculatively probe
-# unconfigured interfaces on first boot after the takeover.
-mkdir -p /etc/NetworkManager/conf.d
-cat > /etc/NetworkManager/conf.d/00-no-auto-default.conf <<EOF
-[main]
-# Don't auto-configure interfaces that have no explicit connection profile.
-# Prevents NM from racing with networkd on first boot after takeover.
-no-auto-default=*
-EOF
 
 success "NetworkManager installed (not yet active)"
 
