@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  install-nm-over-ssh.sh — Safe migration to NetworkManager over a live SSH session
+#  install-nm-over-ssh.sh - Safe migration to NetworkManager over a live SSH session
 #
 #  Installs NetworkManager and schedules a one-time boot-time switchover that
 #  disables whatever network backend is currently running, then hands control
@@ -8,7 +8,7 @@
 #  boot (before any interface is up), your SSH session is never at risk.
 #
 #  After reboot, NetworkManager is running and in control.  This script makes
-#  no NM connection profiles — configure NM however you like afterward.
+#  no NM connection profiles - configure NM however you like afterward.
 #
 #  Supported package managers : apt / dnf / pacman
 #  Supported incumbents        : systemd-networkd, dhcpcd, connman, wicd
@@ -51,7 +51,7 @@ section "Preflight checks"
 
 # ── Must have systemd ─────────────────────────────────────────────────────────
 command -v systemctl &>/dev/null \
-    || error "systemctl not found — this script requires systemd."
+    || error "systemctl not found - this script requires systemd."
 
 # ── Detect package manager ────────────────────────────────────────────────────
 PKG_MGR=""
@@ -65,12 +65,12 @@ info "Package manager : $PKG_MGR"
 
 # ── Skip if NM is already the active backend ──────────────────────────────────
 if systemctl is-active --quiet NetworkManager 2>/dev/null; then
-    success "NetworkManager is already active — nothing to do."
+    success "NetworkManager is already active - nothing to do."
     exit 0
 fi
 
 # ── Detect incumbent network backend ─────────────────────────────────────────
-# We check by active service.  If nothing is active we still proceed — we'll
+# We check by active service.  If nothing is active we still proceed - we'll
 # just skip the disable step and rely on NM winning by default.
 INCUMBENTS=()
 for svc in systemd-networkd dhcpcd connman wicd; do
@@ -82,7 +82,7 @@ done
 if [[ ${#INCUMBENTS[@]} -gt 0 ]]; then
     info "Active incumbent(s) : ${INCUMBENTS[*]}"
 else
-    warn "No recognised incumbent found — will still install NM and mask wpa_supplicant."
+    warn "No recognised incumbent found - will still install NM and mask wpa_supplicant."
 fi
 
 # ── Capture current IP for the user's reference ───────────────────────────────
@@ -92,7 +92,7 @@ info "Current IP (reconnect here after reboot) : ${BOLD}${CURRENT_IP}${RESET}"
 # ── Dry-run summary and early exit ───────────────────────────────────────────
 if [[ $DRY_RUN -eq 1 ]]; then
     echo ""
-    echo -e "${YELLOW}${BOLD}Dry-run mode — no changes will be made.${RESET}"
+    echo -e "${YELLOW}${BOLD}Dry-run mode - no changes will be made.${RESET}"
     echo ""
     echo -e "  Package manager  : ${BOLD}${PKG_MGR}${RESET}"
     if [[ ${#INCUMBENTS[@]} -gt 0 ]]; then
@@ -110,7 +110,7 @@ fi
 section "Installing NetworkManager"
 # =============================================================================
 
-# Safe — just installs the package.  NM is not started or activated here.
+# Safe - just installs the package.  NM is not started or activated here.
 # Your SSH session is unaffected.
 
 case "$PKG_MGR" in
@@ -126,16 +126,23 @@ case "$PKG_MGR" in
         ;;
 esac
 
-# The apt postinstall on Ubuntu auto-enables AND starts NM immediately via
-# symlink (you'll see "Created symlink ...NetworkManager.service" in apt output).
-# We must not call `systemctl stop NetworkManager` — on some systems this races
-# with networkd and hangs indefinitely.
+# We do NOT stop, mask, or kill NM here.
 #
-# Instead: mask NM right now so it cannot start or be started accidentally
-# before the reboot.  The oneshot will unmask it at the right moment.
-systemctl mask NetworkManager 2>/dev/null || true
-# Kill any already-running NM process directly — no blocking systemctl stop.
-pkill -x NetworkManager 2>/dev/null || true
+# The apt postinstall already started NM - fighting it now races with
+# networkd and can briefly drop the interface, killing SSH (ask me how
+# I know).  It's safe to leave NM running alongside networkd until reboot:
+# NM has no connection profiles yet so it won't reconfigure any interface.
+# The oneshot masks networkd and takes full control at the start of next boot.
+#
+# We DO suppress NM's auto-DHCP fallback so it doesn't speculatively probe
+# unconfigured interfaces on first boot after the takeover.
+mkdir -p /etc/NetworkManager/conf.d
+cat > /etc/NetworkManager/conf.d/00-no-auto-default.conf <<EOF
+[main]
+# Don't auto-configure interfaces that have no explicit connection profile.
+# Prevents NM from racing with networkd on first boot after takeover.
+no-auto-default=*
+EOF
 
 success "NetworkManager installed (not yet active)"
 
@@ -143,7 +150,7 @@ success "NetworkManager installed (not yet active)"
 section "Writing switchover oneshot"
 # =============================================================================
 
-# The companion script — runs as the oneshot's ExecStart.
+# The companion script - runs as the oneshot's ExecStart.
 # Logs every step to /var/log/nm-takeover.log for post-mortem if needed.
 TAKEOVER_SCRIPT=/usr/local/lib/nm-takeover.sh
 
@@ -157,7 +164,7 @@ done
 
 cat > "$TAKEOVER_SCRIPT" <<SCRIPT
 #!/usr/bin/env bash
-# nm-takeover.sh — generated by install-nm-over-ssh.sh
+# nm-takeover.sh - generated by install-nm-over-ssh.sh
 # Runs once at boot (before networking), then disables itself.
 set -euo pipefail
 
@@ -178,7 +185,7 @@ systemctl enable NetworkManager 2>>"\$LOG"
 log "Disabling nm-takeover (oneshot, runs once only)"
 systemctl disable nm-takeover 2>>"\$LOG" || true
 
-log "=== nm-takeover complete — NetworkManager will start normally ==="
+log "=== nm-takeover complete - NetworkManager will start normally ==="
 SCRIPT
 
 chmod +x "$TAKEOVER_SCRIPT"
@@ -211,7 +218,7 @@ systemctl enable nm-takeover
 success "nm-takeover.service enabled (fires once on next boot)"
 
 # =============================================================================
-section "Ready — reboot to apply"
+section "Ready - reboot to apply"
 # =============================================================================
 
 PAD=50
@@ -240,5 +247,5 @@ if [[ "${REPLY,,}" == "y" ]]; then
     info "Rebooting..."
     reboot
 else
-    warn "Skipping reboot — run 'sudo reboot' when ready."
+    warn "Skipping reboot - run 'sudo reboot' when ready."
 fi
