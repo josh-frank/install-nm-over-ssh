@@ -126,10 +126,16 @@ case "$PKG_MGR" in
         ;;
 esac
 
-# Ensure NM does NOT auto-start right now — we want the reboot to trigger the
-# oneshot first.  `preset` or install postscripts may have enabled it already.
-systemctl disable NetworkManager 2>/dev/null || true
-systemctl stop    NetworkManager 2>/dev/null || true
+# The apt postinstall on Ubuntu auto-enables AND starts NM immediately via
+# symlink (you'll see "Created symlink ...NetworkManager.service" in apt output).
+# We must not call `systemctl stop NetworkManager` — on some systems this races
+# with networkd and hangs indefinitely.
+#
+# Instead: mask NM right now so it cannot start or be started accidentally
+# before the reboot.  The oneshot will unmask it at the right moment.
+systemctl mask NetworkManager 2>/dev/null || true
+# Kill any already-running NM process directly — no blocking systemctl stop.
+pkill -x NetworkManager 2>/dev/null || true
 
 success "NetworkManager installed (not yet active)"
 
