@@ -7,8 +7,7 @@
 #  to NM.  Because the dangerous work happens at the very start of the next
 #  boot (before any interface is up), your SSH session is never at risk.
 #
-#  After reboot, NetworkManager is running and in control.  This script makes
-#  no NM connection profiles - configure NM however you like afterward.
+#  After reboot, NetworkManager is running and managing your interface.
 #
 #  Supported package managers : apt / dnf / pacman
 #  Supported incumbents        : systemd-networkd, dhcpcd, connman, wicd
@@ -34,7 +33,6 @@ DRY_RUN=0
 [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
 
 dry() {
-    # In dry-run mode: print what would run, don't run it.
     if [[ $DRY_RUN -eq 1 ]]; then
         echo -e "  ${YELLOW}[dry-run]${RESET} $*"
     else
@@ -46,10 +44,8 @@ dry() {
 section "Preflight checks"
 # =============================================================================
 
-# ── Must be root ──────────────────────────────────────────────────────────────
 [[ $EUID -eq 0 ]] || error "Please run as root:  sudo bash install-nm-over-ssh.sh"
 
-# ── Must have systemd ─────────────────────────────────────────────────────────
 command -v systemctl &>/dev/null \
     || error "systemctl not found - this script requires systemd."
 
@@ -63,15 +59,13 @@ else
 fi
 info "Package manager : $PKG_MGR"
 
-# ── Skip if NM is already the active backend ──────────────────────────────────
+# ── Skip if NM is already active AND managing an interface ───────────────────
 if systemctl is-active --quiet NetworkManager 2>/dev/null; then
     success "NetworkManager is already active - nothing to do."
     exit 0
 fi
 
 # ── Detect incumbent network backend ─────────────────────────────────────────
-# We check by active service.  If nothing is active we still proceed - we'll
-# just skip the disable step and rely on NM winning by default.
 INCUMBENTS=()
 for svc in systemd-networkd dhcpcd connman wicd; do
     if systemctl is-active --quiet "$svc" 2>/dev/null; then
@@ -82,10 +76,22 @@ done
 if [[ ${#INCUMBENTS[@]} -gt 0 ]]; then
     info "Active incumbent(s) : ${INCUMBENTS[*]}"
 else
-    warn "No recognised incumbent found - will still install NM and mask wpa_supplicant."
+    warn "No recognised incumbent found - will still install NM."
 fi
 
-# ── Capture current IP for the user's reference ───────────────────────────────
+# ── Detect the primary network interface ─────────────────────────────────────
+# Prefer the interface carrying the default route (i.e. the one SSH is using).
+PRIMARY_IF=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+if [[ -z "$PRIMARY_IF" ]]; then
+    # Fallback: first non-loopback interface that is UP
+    PRIMARY_IF=$(ip -o link show up | awk -F': ' '$2 != "lo" {print $2; exit}')
+fi
+if [[ -z "$PRIMARY_IF" ]]; then
+    warn "Could not detect primary interface - defaulting to eth0"
+    PRIMARY_IF="eth0"
+fi
+info "Primary interface (SSH session) : ${BOLD}${PRIMARY_IF}${RESET}"
+
 CURRENT_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "unknown")
 info "Current IP (reconnect here after reboot) : ${BOLD}${CURRENT_IP}${RESET}"
 
@@ -95,11 +101,10 @@ if [[ $DRY_RUN -eq 1 ]]; then
     echo -e "${YELLOW}${BOLD}Dry-run mode - no changes will be made.${RESET}"
     echo ""
     echo -e "  Package manager  : ${BOLD}${PKG_MGR}${RESET}"
-    if [[ ${#INCUMBENTS[@]} -gt 0 ]]; then
-        echo -e "  Will disable     : ${BOLD}${INCUMBENTS[*]}${RESET}"
-    fi
-    echo -e "  Will mask        : ${BOLD}wpa_supplicant${RESET}  (always)"
+    echo -e "  Primary iface    : ${BOLD}${PRIMARY_IF}${RESET}"
+    [[ ${#INCUMBENTS[@]} -gt 0 ]] && echo -e "  Will disable     : ${BOLD}${INCUMBENTS[*]}${RESET}"
     echo -e "  Will install     : ${BOLD}NetworkManager${RESET}"
+    echo -e "  NM kept hands-off during install via : ${BOLD}unmanaged-devices=${PRIMARY_IF}${RESET}"
     echo -e "  Oneshot service  : ${BOLD}nm-takeover.service${RESET}  (runs once at next boot)"
     echo ""
     echo "Run without --dry-run to apply."
@@ -107,11 +112,33 @@ if [[ $DRY_RUN -eq 1 ]]; then
 fi
 
 # =============================================================================
+section "Pre-installing NM guard: unmanaged-devices"
+# =============================================================================
+#
+# FIX #1: Before we install NM (apt post-install starts it immediately),
+# tell NM to never touch our primary interface.  This config file is written
+# BEFORE the package is installed, so NM reads it on its very first start
+# and leaves eth0/the SSH interface alone.
+#
+# The oneshot removes this file at next boot, after the old backend is already
+# dead, so NM then takes over cleanly.
+
+NM_CONF_DIR=/etc/NetworkManager/conf.d
+mkdir -p "$NM_CONF_DIR"
+
+cat > "${NM_CONF_DIR}/99-unmanaged-ssh-iface.conf" <<CONF
+# Written by install-nm-over-ssh.sh
+# Prevents NM from touching ${PRIMARY_IF} while the old network backend
+# is still live.  Removed by nm-takeover.service on first boot.
+[keyfile]
+unmanaged-devices=interface-name:${PRIMARY_IF}
+CONF
+
+success "NM guard written: NM will not touch ${PRIMARY_IF} until reboot"
+
+# =============================================================================
 section "Installing NetworkManager"
 # =============================================================================
-
-# Safe - just installs the package.  NM is not started or activated here.
-# Your SSH session is unaffected.
 
 case "$PKG_MGR" in
     apt)
@@ -126,25 +153,16 @@ case "$PKG_MGR" in
         ;;
 esac
 
-# We do NOT stop, mask, or kill NM here.
-#
-# The apt postinstall already started NM - fighting it now races with
-# networkd and can briefly drop the interface, killing SSH.  It's safe
-# to leave NM running alongside networkd until reboot: NM has no
-# connection profiles yet so it won't reconfigure any interface.
-# The oneshot masks networkd and takes full control at the start of next boot.
-
-success "NetworkManager installed (not yet active)"
+# NM is now installed (and apt may have started it), but it won't touch
+# ${PRIMARY_IF} because of the unmanaged-devices guard above.
+success "NetworkManager installed (held off ${PRIMARY_IF} by guard config)"
 
 # =============================================================================
 section "Writing switchover oneshot"
 # =============================================================================
 
-# The companion script - runs as the oneshot's ExecStart.
-# Logs every step to /var/log/nm-takeover.log for post-mortem if needed.
 TAKEOVER_SCRIPT=/usr/local/lib/nm-takeover.sh
 
-# Build the disable block dynamically from detected incumbents.
 DISABLE_CMDS=""
 for svc in "${INCUMBENTS[@]}"; do
     DISABLE_CMDS+="    log \"Disabling incumbent: ${svc}\"\n"
@@ -163,15 +181,36 @@ log() { echo "\$(date '+%Y-%m-%d %H:%M:%S')  \$*" | tee -a "\$LOG"; }
 
 log "=== nm-takeover starting ==="
 
+# ── 1. Disable incumbent backends ────────────────────────────────────────────
 $(printf '%b' "$DISABLE_CMDS")
 
-log "Masking wpa_supplicant"
-systemctl mask wpa_supplicant 2>>"\$LOG" || true
+# ── 2. FIX #2: Remove the unmanaged guard so NM will manage ${PRIMARY_IF} ───
+# This is safe now: the old backend is already masked/disabled above,
+# so there is no race.  NM will pick up ${PRIMARY_IF} when it starts.
+log "Removing unmanaged-devices guard for ${PRIMARY_IF}"
+rm -f /etc/NetworkManager/conf.d/99-unmanaged-ssh-iface.conf
 
+# ── 3. FIX #3: Do NOT mask wpa_supplicant - disable only ─────────────────────
+# Masking breaks systems (especially RPi) where wpa_supplicant is pulled
+# in as a hard dependency by other units even on wired-only setups.
+# NM ships its own internal supplicant; disabling the standalone daemon
+# is sufficient.
+log "Disabling standalone wpa_supplicant"
+systemctl disable wpa_supplicant 2>>"\$LOG" || true
+systemctl stop    wpa_supplicant 2>>"\$LOG" || true
+
+# ── 4. Enable AND start NetworkManager ───────────────────────────────────────
+# FIX #4: The original script only called 'enable', not 'start'.
+# Because this oneshot runs Before=network-pre.target the network stack
+# hasn't come up yet - we enable it here so systemd starts NM in the
+# normal boot sequence right after this unit exits.
 log "Enabling NetworkManager"
 systemctl unmask NetworkManager 2>>"\$LOG" || true
 systemctl enable NetworkManager 2>>"\$LOG"
+# Note: do NOT call 'systemctl start' here - we are Before=network-pre.target
+# and systemd will start NM via the normal dependency chain.
 
+# ── 5. Self-disable so this only runs once ───────────────────────────────────
 log "Disabling nm-takeover (oneshot, runs once only)"
 systemctl disable nm-takeover 2>>"\$LOG" || true
 
@@ -181,9 +220,9 @@ SCRIPT
 chmod +x "$TAKEOVER_SCRIPT"
 success "Switchover script written: $TAKEOVER_SCRIPT"
 
-# The oneshot systemd unit.
-# DefaultDependencies=no + Before=network-pre.target ensures this fires
-# as early as possible, before ANY network interface comes up.
+# ── Systemd unit ─────────────────────────────────────────────────────────────
+# DefaultDependencies=no + Before=network-pre.target fires this as early as
+# possible, before ANY interface comes up.  The old backend never starts.
 cat > /etc/systemd/system/nm-takeover.service <<UNIT
 [Unit]
 Description=One-time switchover to NetworkManager
@@ -211,18 +250,18 @@ success "nm-takeover.service enabled (fires once on next boot)"
 section "Ready - reboot to apply"
 # =============================================================================
 
-PAD=50
+PAD=54
 print_row() { printf "│ %-${PAD}s │\n" "$1"; }
 
 echo ""
 echo -e "${GREEN}${BOLD}┌$(printf '─%.0s' $(seq 1 $((PAD+2))))┐${RESET}"
 print_row "NetworkManager installed, switchover scheduled"
 print_row ""
-if [[ ${#INCUMBENTS[@]} -gt 0 ]]; then
-    print_row "  Will disable : ${INCUMBENTS[*]}"
-fi
-print_row "  Will mask    : wpa_supplicant"
-print_row "  Will enable  : NetworkManager"
+print_row "  Primary interface  : ${PRIMARY_IF}"
+[[ ${#INCUMBENTS[@]} -gt 0 ]] && \
+print_row "  Will disable       : ${INCUMBENTS[*]}"
+print_row "  wpa_supplicant     : disabled (not masked)"
+print_row "  Will enable+start  : NetworkManager"
 print_row ""
 print_row "  Reconnect after reboot : ${CURRENT_IP}"
 print_row "  Takeover log           : /var/log/nm-takeover.log"
